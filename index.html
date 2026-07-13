@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ad Auction Demo - Publisher Simulation</title>
+
+<!--
+  wasm_exec.js is the Go runtime shim that provides the JS <-> Go bridge
+  (syscall/js support, the Go scheduler running on the JS event loop, etc).
+  It has to be loaded before we can instantiate the compiled module.
+  Build it with engine/build.sh and copy it alongside this file.
+-->
+<script src="wasm_exec.js"></script>
+
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --panel: #ffffff;
+    --border: #dfe3ea;
+    --text: #1a1d24;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --good: #15803d;
+    --bad: #dc2626;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 40px 20px;
+  }
+
+  .page {
+    max-width: 760px;
+    margin: 0 auto;
+  }
+
+  header h1 {
+    font-size: 1.4rem;
+    margin-bottom: 4px;
+  }
+
+  header p {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-top: 0;
+  }
+
+  /* This box stands in for a publisher's actual ad slot, the thing that,
+     in a real page, would normally be filled by a server-rendered ad tag
+     or a slow client-side RTB round trip. Here it's filled entirely by
+     the local Wasm auction. */
+  .ad-slot {
+    margin-top: 24px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 20px;
+    min-height: 260px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    text-align: center;
+  }
+
+  .ad-slot img {
+    max-width: 100%;
+    border-radius: 6px;
+    display: block;
+  }
+
+  .ad-meta {
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+
+  .status-line {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.ok { background: var(--good); }
+  .dot.err { background: var(--bad); }
+
+  .benchmark {
+    margin-top: 20px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+
+  .metric {
+    border: 1px solid #b8860b;
+    border-radius: 8px;
+    padding: 14px;
+    background: #d4a017;
+  }
+
+  .metric .label {
+    font-size: 0.75rem;
+    color: #4a3800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .metric .value {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-top: 4px;
+    color: #2e2200;
+  }
+
+  .bid-table {
+    margin-top: 24px;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+
+  .bid-table th, .bid-table td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .bid-table th {
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  .bid-table tr.winning-row {
+    color: var(--good);
+    font-weight: 600;
+  }
+
+  select, button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+  }
+
+  button {
+    cursor: pointer;
+  }
+  button:hover {
+    border-color: var(--accent);
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: 16px;
+  }
+
+  .error-box {
+    margin-top: 16px;
+    border: 1px solid var(--bad);
+    background: rgba(220, 38, 38, 0.06);
+    color: var(--bad);
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+  <header>
+    <h1>Ad Auctioning Demo</h1>
+    <p>Simulated publisher page, bidding signals are fetched once, then every auction decision runs locally in Wasm.</p>
+  </header>
+
+  <div class="controls">
+    <label for="geoSelect" class="ad-meta">Simulated user geo:</label>
+    <select id="geoSelect">
+      <option value="US">US</option>
+      <option value="CA">CA</option>
+      <option value="GB">GB</option>
+      <option value="DE">DE</option>
+      <option value="AU">AU</option>
+      <option value="FR">FR (no dedicated demand, tests ALL-geo fallback)</option>
+    </select>
+    <button id="runButton" disabled>Run Auction</button>
+  </div>
+
+  <div class="status-line" id="statusLine">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Booting Wasm engine…</span>
+  </div>
+
+  <div id="errorBox" style="display:none" class="error-box"></div>
+
+  <div class="ad-slot" id="adSlot">
+    <span class="ad-meta">No auction has run yet.</span>
+  </div>
+
+  <div class="benchmark">
+    <div class="metric">
+      <div class="label">Bids Fetched</div>
+      <div class="value" id="metricBidCount">-</div>
+    </div>
+    <div class="metric">
+      <div class="label">Auction Time (Wasm)</div>
+      <div class="value" id="metricAuctionMs">-</div>
+    </div>
+    <div class="metric">
+      <div class="label">Clearing Price</div>
+      <div class="value" id="metricClearingPrice">-</div>
+    </div>
+  </div>
+
+  <table class="bid-table" id="bidTable" style="display:none">
+    <thead>
+      <tr><th>Buyer</th><th>Bid CPM</th><th>Geo</th></tr>
+    </thead>
+    <tbody id="bidTableBody"></tbody>
+  </table>
+</div>
+
+<script>
+// hardcoded for local dev, would come from an env var in a real deploy
+const BIDS_ENDPOINT = "http://localhost:8000/api/bids";
+
+const statusDot = document.getElementById("statusDot");
+const statusText = document.getElementById("statusText");
+const errorBox = document.getElementById("errorBox");
+const adSlot = document.getElementById("adSlot");
+const runButton = document.getElementById("runButton");
+const geoSelect = document.getElementById("geoSelect");
+const bidTable = document.getElementById("bidTable");
+const bidTableBody = document.getElementById("bidTableBody");
+
+const metricBidCount = document.getElementById("metricBidCount");
+const metricAuctionMs = document.getElementById("metricAuctionMs");
+const metricClearingPrice = document.getElementById("metricClearingPrice");
+
+// cached between auction runs so switching the geo dropdown doesn't
+// trigger a whole new fetch, only "Run Auction" should do that
+let latestBids = null;
+
+function setStatus(message, state) {
+  statusText.textContent = message;
+  statusDot.className = "dot" + (state ? " " + state : "");
+}
+
+function showError(message) {
+  errorBox.textContent = message;
+  errorBox.style.display = "block";
+}
+
+function clearError() {
+  errorBox.style.display = "none";
+  errorBox.textContent = "";
+}
+
+// Boots the Go/Wasm module. instantiateStreaming lets the browser start
+// compiling while bytes are still coming in over the network, but it
+// needs the server to send the right content-type header, which not
+// every local static server bothers with. Falling back to the plain
+// arraybuffer path if that fails rather than blowing up the whole demo.
+async function loadWasmEngine() {
+  const go = new Go();
+
+  let result;
+  try {
+    result = await WebAssembly.instantiateStreaming(
+      fetch("auction.wasm"),
+      go.importObject
+    );
+  } catch (streamingErr) {
+    console.warn("instantiateStreaming failed, falling back to arraybuffer:", streamingErr);
+    const response = await fetch("auction.wasm");
+    const bytes = await response.arrayBuffer();
+    result = await WebAssembly.instantiate(bytes, go.importObject);
+  }
+
+  // go.run() never resolves by itself. The Go side just blocks forever
+  // in select{}, so we don't await it, we just kick it off and poll for
+  // the ready flag it sets once main() has actually registered the
+  // exported function.
+  go.run(result.instance);
+  await waitForEngineReady();
+}
+
+function waitForEngineReady(timeoutMs = 5000) {
+  const start = performance.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (window.__auctionEngineReady === true && typeof window.runAuctionEngine === "function") {
+        resolve();
+        return;
+      }
+      if (performance.now() - start > timeoutMs) {
+        reject(new Error("Timed out waiting for Wasm auction engine to register"));
+        return;
+      }
+      requestAnimationFrame(check);
+    };
+    check();
+  });
+}
+
+async function fetchBids() {
+  const response = await fetch(BIDS_ENDPOINT);
+  if (!response.ok) {
+    throw new Error(`Bids endpoint returned HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+// Bids get passed to Go as a JSON string, not a live JS object. See the
+// comment in auction.go for why that's the faster path across the Wasm
+// boundary.
+function runAuction(bids, userGeo) {
+  const bidsJson = JSON.stringify(bids);
+
+  const startTime = performance.now();
+  const result = window.runAuctionEngine(bidsJson, userGeo);
+  const endTime = performance.now();
+
+  return {
+    result,
+    durationMs: endTime - startTime,
+  };
+}
+
+function renderBidTable(bids, winningBidId) {
+  bidTableBody.innerHTML = "";
+  for (const bid of bids) {
+    const row = document.createElement("tr");
+    if (bid.bid_id === winningBidId) {
+      row.className = "winning-row";
+    }
+    row.innerHTML = `
+      <td>${escapeHtml(bid.buyer_name)}</td>
+      <td>$${bid.bid_cpm.toFixed(2)}</td>
+      <td>${escapeHtml(bid.target_geo)}</td>
+    `;
+    bidTableBody.appendChild(row);
+  }
+  bidTable.style.display = "table";
+}
+
+function renderWinningAd(auctionResult) {
+  if (!auctionResult.success) {
+    adSlot.innerHTML = `<span class="ad-meta">No ad rendered: ${escapeHtml(auctionResult.error)}</span>`;
+    return;
+  }
+
+  adSlot.innerHTML = `
+    <img src="${auctionResult.creativeUrl}" alt="Winning creative for ${escapeHtml(auctionResult.winningBuyer)}">
+    <div class="ad-meta">
+      Served by <strong>${escapeHtml(auctionResult.winningBuyer)}</strong>
+      &middot; cleared at $${auctionResult.clearingPrice.toFixed(2)} CPM
+    </div>
+  `;
+}
+
+// Bid data happens to come from our own backend in this demo, but treating
+// it as untrusted is the right habit regardless, since a real bids endpoint is
+// fed by external DSPs whose buyer_name field isn't under your control.
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+async function handleRunAuction() {
+  clearError();
+  runButton.disabled = true;
+
+  try {
+    if (!latestBids) {
+      setStatus("Fetching bidding signals…");
+      latestBids = await fetchBids();
+      metricBidCount.textContent = latestBids.length;
+    }
+
+    const userGeo = geoSelect.value;
+    setStatus("Running auction in Wasm…");
+
+    const { result, durationMs } = runAuction(latestBids, userGeo);
+
+    metricAuctionMs.textContent = `${durationMs.toFixed(3)} ms`;
+    metricClearingPrice.textContent = result.success
+      ? `$${result.clearingPrice.toFixed(2)}`
+      : "-";
+
+    renderWinningAd(result);
+    renderBidTable(latestBids, result.winningBidId);
+
+    setStatus("Auction complete.", "ok");
+  } catch (err) {
+    console.error(err);
+    showError(err.message || "Unexpected error running the auction.");
+    setStatus("Auction failed.", "err");
+  } finally {
+    runButton.disabled = false;
+  }
+}
+
+geoSelect.addEventListener("change", handleRunAuction);
+runButton.addEventListener("click", () => {
+  latestBids = null; // treat this as a fresh pageview, refetch signals
+  handleRunAuction();
+});
+
+(async function init() {
+  try {
+    await loadWasmEngine();
+    setStatus("Wasm engine ready.", "ok");
+    runButton.disabled = false;
+    handleRunAuction(); // run once automatically so the page isn't empty on load
+  } catch (err) {
+    console.error(err);
+    setStatus("Failed to load Wasm engine.", "err");
+    showError(
+      "Could not initialize the auction engine. Make sure auction.wasm and " +
+      "wasm_exec.js are in this directory (run engine/build.sh), and that " +
+      "you're viewing this page over http:// rather than file://."
+    );
+  }
+})();
+</script>
+
+</body>
+</html>
